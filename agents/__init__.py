@@ -11,6 +11,7 @@ from .templates.langgraph_thinking import LangGraphThinking
 from .templates.llm_agents import (
     LLM,
     FastLLM,
+    GuidedGameStateLLMOpenRouter,
     GuidedLLMls20,
     GuidedLLMls20OpenRouter,
     ReasoningLLM,
@@ -48,6 +49,7 @@ __all__ = [
     "ReasoningLLM",
     "GuidedLLMls20",
     "GuidedLLMls20OpenRouter",
+    "GuidedGameStateLLMOpenRouter",
     "ReasoningAgent",
     "SmolCodingAgent",
     "SmolVisionAgent",

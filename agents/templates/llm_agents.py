@@ -39,6 +39,10 @@ class LLM(Agent):
     def _resolve_model(self) -> str:
         return self.MODEL
 
+    def _postprocess_observation_response(self, content: str) -> str:
+        """Normalize the observation response before storing it in the transcript."""
+        return content
+
     @property
     def name(self) -> str:
         obs = "with-observe" if self.DO_OBSERVATION else "no-observe"
@@ -132,14 +136,15 @@ class LLM(Agent):
             except openai.BadRequestError as e:
                 logger.info(f"Message dump: {self.messages}")
                 raise e
-            self.track_tokens(
-                response.usage.total_tokens, response.choices[0].message.content
+            observation_content = self._postprocess_observation_response(
+                response.choices[0].message.content or ""
             )
+            self.track_tokens(response.usage.total_tokens, observation_content)
             message3 = {
                 "role": "assistant",
-                "content": response.choices[0].message.content,
+                "content": observation_content,
             }
-            logger.info(f"Assistant: {response.choices[0].message.content}")
+            logger.info(f"Assistant: {observation_content}")
             self.push_message(message3)
 
         # now ask for the next action
@@ -581,35 +586,10 @@ class GuidedLLMls20(LLM, Agent):
 You are an agent playing a dynamic game. Your objective is to
 WIN and avoid GAME_OVER while minimizing actions.
 
-One action produces one Frame. One Frame is made of one or more sequential
-Grids. Each Grid is a matrix size INT<0,63> by INT<0,63> filled with
-INT<0,15> values.
-
-You are playing a game called LockSmith. Rules and strategy:
-* RESET: start over, ACTION1: move up, ACTION2: move down, ACTION3: move left, ACTION4: move right (ACTION5 and ACTION6 do nothing in this game)
-* you may may one action per turn
-* you goal is to exit door that has key depicted on it
-* you have your own key showed in the left bottom corner
-* to exit the door your personal key picture should match the door key picture
-* 6 levels total, score shows which level, complete all levels to win (grid row 62)
-* start each level with limited energy. you GAME_OVER if you run out (grid row 61)
-* your player is a 5x5 square: [[12,12,12,12,12], [12,12,12,12,12], [9,9,9,9,9], [9,9,9,9,9], [9,9,9,9,9]]
-* the grid represents a birds-eye view of the level
-* walls are made of INT<4>, you cannot move through a wall
-* walkable floor area is INT<3>
-* current key is shown in bottom-left of entire grid
-* the exit door is a 9x9 square with INT<5> interior
-* to find a new key shape, touch the key rotator, a 4x4 plus sign denoted by INT<0> and INT<1> 
-* if the key shape in the bottom left corner matches the exit door, avoid the key rotator and move towards the exit door
-* if the shape doesn't match, rotate more than once, move 1 space away from the rotator and back on
-* continue rotating the shape and color of the key until the key matches the one inside the exit door (scaled down 2X)
-* if the grid does not change after an action, you probably tried to move into a wall
-* You are ON the rotator only if the player block overlaps the rotator tiles in the current frame.
-* Before making decision, reflect if couple of previous steps are moving your closer to the goal.
-
-An example of a good strategy observation:
-The player 5x5 made of INT<12> and INT<9> is standing by a wall of INT<4>, so I cannot move up anymore and should
-move towards the rotator with a good choice of action.
+At each stage 
+* analyse trace of previous actions and environment state changes
+* produce hypothesis about game goal, mechanics, constraints and your current state
+* choose most probable next action
 
 # TURN:
 Call exactly one action.
@@ -639,3 +619,194 @@ class GuidedLLMls20OpenRouter(GuidedLLMls20, Agent):
 
     def _resolve_model(self) -> str:
         return self._openrouter_model
+
+
+class GuidedGameStateLLMOpenRouter(GuidedLLMls20OpenRouter, Agent):
+    """OpenRouter-guided Locksmith agent with a persisted canonical belief state."""
+
+    FALLBACK_BELIEF_STATE: dict[str, Any] = {
+        "game_mechanics": "Unknown; infer from frame transitions.",
+        "game_goal": "Reach WIN and avoid GAME_OVER while minimizing actions.",
+        "current_state": "No validated belief state yet; rely on the latest frame and action trace.",
+        "next_recommended_action": {
+            "action": "ACTION5",
+            "input_data": {},
+            "reason": "Fallback placeholder because the observation output was invalid.",
+        },
+    }
+    VALID_ACTION_NAMES = {action.name for action in GameAction}
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.belief_state: dict[str, Any] | None = None
+        self.belief_state_raw = ""
+        self.belief_state_error: str | None = None
+
+    def _canonical_belief_state_json(self) -> str:
+        belief_state = self.belief_state or self.FALLBACK_BELIEF_STATE
+        return json.dumps(belief_state, indent=2)
+
+    def _validate_belief_state(self, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("belief state must be a JSON object")
+
+        sections = (
+            "game_mechanics",
+            "game_goal",
+            "current_state",
+            "next_recommended_action",
+        )
+        for section in sections[:3]:
+            value = payload.get(section)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{section} must be a non-empty string")
+
+        next_action = payload.get("next_recommended_action")
+        if not isinstance(next_action, dict):
+            raise ValueError("next_recommended_action must be an object")
+
+        action_name = next_action.get("action")
+        if action_name not in self.VALID_ACTION_NAMES:
+            raise ValueError("next_recommended_action.action must be a valid GameAction")
+
+        input_data = next_action.get("input_data")
+        if not isinstance(input_data, dict):
+            raise ValueError("next_recommended_action.input_data must be an object")
+
+        reason = next_action.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("next_recommended_action.reason must be a non-empty string")
+
+        return {
+            "game_mechanics": payload["game_mechanics"],
+            "game_goal": payload["game_goal"],
+            "current_state": payload["current_state"],
+            "next_recommended_action": {
+                "action": action_name,
+                "input_data": input_data,
+                "reason": reason,
+            },
+        }
+
+    def _postprocess_observation_response(self, content: str) -> str:
+        self.belief_state_raw = content
+        self.belief_state_error = None
+        try:
+            parsed = json.loads(content)
+            self.belief_state = self._validate_belief_state(parsed)
+        except Exception as exc:
+            self.belief_state_error = str(exc)
+            if self.belief_state is None:
+                self.belief_state = json.loads(json.dumps(self.FALLBACK_BELIEF_STATE))
+            logger.warning("Failed to normalize belief state: %s", self.belief_state_error)
+        return self._canonical_belief_state_json()
+
+    def build_func_resp_prompt(self, latest_frame: FrameData) -> str:
+        return textwrap.dedent(
+            """
+# CONTEXT:
+You are building a belief state for the game from the latest transition.
+Return JSON only. Do not include markdown, prose outside JSON, or extra keys.
+
+# REQUIRED_SCHEMA:
+{{
+  "game_mechanics": "string",
+  "game_goal": "string",
+  "current_state": "string",
+  "next_recommended_action": {{
+    "action": "RESET|ACTION1|ACTION2|ACTION3|ACTION4|ACTION5|ACTION6",
+    "input_data": {{}},
+    "reason": "string"
+  }}
+}}
+
+# PRIOR_BELIEF_STATE:
+{belief_state}
+
+# LATEST_TRANSITION:
+State: {state}
+Score: {score}
+Frame:
+{latest_frame}
+
+# TURN:
+Infer the most likely rules, goal, current game situation, and the single best next action.
+Return JSON only and ensure next_recommended_action.input_data is an object.
+        """.format(
+                belief_state=self._canonical_belief_state_json()
+                if self.belief_state is not None
+                else "null",
+                latest_frame=self.pretty_print_3d(latest_frame.frame),
+                score=latest_frame.levels_completed,
+                state=latest_frame.state.name,
+            )
+        )
+
+    def build_user_prompt(self, latest_frame: FrameData) -> str:
+        belief_state_json = self._canonical_belief_state_json()
+        recommended_action = (self.belief_state or self.FALLBACK_BELIEF_STATE)[
+            "next_recommended_action"
+        ]
+        return textwrap.dedent(
+            """
+# CONTEXT:
+You are an agent playing a game. Use the latest validated belief state as the default plan for this turn.
+Call exactly one tool and prefer the recommended action unless the current frame clearly contradicts it.
+
+# BELIEF_STATE:
+{belief_state}
+
+# DEFAULT_PLAN:
+Action: {action}
+Input: {input_data}
+Reason: {reason}
+
+# LIVE_STATE:
+State: {state}
+Score: {score}
+Frame:
+{latest_frame}
+
+# TURN:
+Call exactly one action tool. Do not call multiple tools.
+        """.format(
+                belief_state=belief_state_json,
+                action=recommended_action["action"],
+                input_data=json.dumps(recommended_action["input_data"]),
+                reason=recommended_action["reason"],
+                latest_frame=self.pretty_print_3d(latest_frame.frame),
+                score=latest_frame.levels_completed,
+                state=latest_frame.state.name,
+            )
+        )
+
+    def choose_action(
+        self, frames: list[FrameData], latest_frame: FrameData
+    ) -> GameAction:
+        action = super().choose_action(frames, latest_frame)
+        if action is GameAction.RESET:
+            return action
+
+        action.reasoning = {
+            "model": self._resolve_model(),
+            "action_chosen": action.name,
+            "reasoning_effort": self.REASONING_EFFORT,
+            "reasoning_tokens": self._last_reasoning_tokens,
+            "total_reasoning_tokens": self._total_reasoning_tokens,
+            "game_context": {
+                "score": latest_frame.levels_completed,
+                "state": latest_frame.state.name,
+                "action_counter": self.action_counter,
+                "frame_count": len(frames),
+            },
+            "agent_type": "guided_game_state_llm",
+            "game_rules": "locksmith",
+            "response_preview": self._last_response_content[:2000] + "..."
+            if len(self._last_response_content) > 2000
+            else self._last_response_content,
+            "belief_state": self.belief_state,
+            "belief_state_raw": self.belief_state_raw,
+        }
+        if self.belief_state_error:
+            action.reasoning["belief_state_error"] = self.belief_state_error
+        return action

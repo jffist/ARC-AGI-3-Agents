@@ -29,6 +29,13 @@ export ARC_API_KEY="your_api_key_here"
 uv run main.py --agent=random --game=ls20
 ```
 
+To experiment with OpenRouter models on the guided Locksmith agent, set
+`OPENROUTER_API_KEY` and an explicit `OPENROUTER_MODEL`, then run:
+
+```bash
+OPENROUTER_MODEL=openai/gpt-4.1-mini uv run main.py --agent=guidedllmls20openrouter --game=ls20
+```
+
 For more information, see the [documentation](https://three.arcprize.org/docs#quick-start) or the [tutorial video](https://youtu.be/xEVg9dcJMkw).
 
 ## Changelog

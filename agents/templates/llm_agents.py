@@ -16,7 +16,7 @@ logger = logging.getLogger()
 class LLM(Agent):
     """An agent that uses a base LLM model to play games."""
 
-    MAX_ACTIONS: int = 80
+    MAX_ACTIONS: int = 10
     DO_OBSERVATION: bool = True
     REASONING_EFFORT: Optional[str] = None
     MODEL_REQUIRES_TOOLS: bool = False
@@ -33,10 +33,16 @@ class LLM(Agent):
         self.messages = []
         self.token_counter = 0
 
+    def _build_client(self) -> OpenAIClient:
+        return OpenAIClient(api_key=os.environ.get("OPENAI_API_KEY", ""))
+
+    def _resolve_model(self) -> str:
+        return self.MODEL
+
     @property
     def name(self) -> str:
         obs = "with-observe" if self.DO_OBSERVATION else "no-observe"
-        sanitized_model_name = self.MODEL.replace("/", "-").replace(":", "-")
+        sanitized_model_name = self._resolve_model().replace("/", "-").replace(":", "-")
         name = f"{super().name}.{sanitized_model_name}.{obs}"
         if self.REASONING_EFFORT:
             name += f".{self.REASONING_EFFORT}"
@@ -60,7 +66,8 @@ class LLM(Agent):
         logging.getLogger("openai").setLevel(logging.CRITICAL)
         logging.getLogger("httpx").setLevel(logging.CRITICAL)
 
-        client = OpenAIClient(api_key=os.environ.get("OPENAI_API_KEY", ""))
+        client = self._build_client()
+        model = self._resolve_model()
 
         functions = self.build_functions()
         tools = self.build_tools()
@@ -116,7 +123,7 @@ class LLM(Agent):
             logger.info("Sending to Assistant for observation...")
             try:
                 create_kwargs = {
-                    "model": self.MODEL,
+                    "model": model,
                     "messages": self.messages,
                 }
                 if self.REASONING_EFFORT is not None:
@@ -148,7 +155,7 @@ class LLM(Agent):
             logger.info("Sending to Assistant for action...")
             try:
                 create_kwargs = {
-                    "model": self.MODEL,
+                    "model": model,
                     "messages": self.messages,
                     "tools": tools,
                     "tool_choice": "required",
@@ -186,7 +193,7 @@ class LLM(Agent):
             logger.info("Sending to Assistant for action...")
             try:
                 create_kwargs = {
-                    "model": self.MODEL,
+                    "model": model,
                     "messages": self.messages,
                     "functions": functions,
                     "function_call": "auto",
@@ -403,7 +410,7 @@ Call exactly one action.
 class ReasoningLLM(LLM, Agent):
     """An LLM agent that uses o4-mini and captures reasoning metadata in the action.reasoning field."""
 
-    MAX_ACTIONS = 80
+    MAX_ACTIONS = 10
     DO_OBSERVATION = True
     MODEL_REQUIRES_TOOLS = True
     MODEL = "o4-mini"
@@ -423,7 +430,7 @@ class ReasoningLLM(LLM, Agent):
 
         # Store reasoning metadata in the action.reasoning field
         action.reasoning = {
-            "model": self.MODEL,
+            "model": self._resolve_model(),
             "action_chosen": action.name,
             "reasoning_tokens": self._last_reasoning_tokens,
             "total_reasoning_tokens": self._total_reasoning_tokens,
@@ -465,14 +472,14 @@ class ReasoningLLM(LLM, Agent):
                 )
                 self._total_reasoning_tokens += self._last_reasoning_tokens
                 logger.debug(
-                    f"Captured {self._last_reasoning_tokens} reasoning tokens from {self.MODEL} response"
+                    f"Captured {self._last_reasoning_tokens} reasoning tokens from {self._resolve_model()} response"
                 )
 
 
 class FastLLM(LLM, Agent):
     """Similar to LLM, but skips observations."""
 
-    MAX_ACTIONS = 80
+    MAX_ACTIONS = 10
     DO_OBSERVATION = False
     MODEL = "gpt-4o-mini"
 
@@ -492,13 +499,14 @@ Call exactly one action.
         """.format()
         )
 
-
-class GuidedLLM(LLM, Agent):
+class GuidedLLMls20(LLM, Agent):
     """Similar to LLM, with explicit human-provided rules in the user prompt to increase success rate."""
 
-    MAX_ACTIONS = 80
+    MAX_ACTIONS = 10
     DO_OBSERVATION = True
-    MODEL = "o3"
+    #MODEL = "o3"
+    #MODEL = "gpt-5.4" # Function tools with reasoning_effort are not supported for gpt-5.4 in /v1/chat/completions. Please use /v1/responses instead.', 'type': 'invalid_request_error
+    MODEL = "gpt-5.2"
     MODEL_REQUIRES_TOOLS = True
     MESSAGE_LIMIT = 10
     REASONING_EFFORT = "high"
@@ -518,7 +526,7 @@ class GuidedLLM(LLM, Agent):
 
         # Store reasoning metadata in the action.reasoning field
         action.reasoning = {
-            "model": self.MODEL,
+            "model": self._resolve_model(),
             "action_chosen": action.name,
             "reasoning_effort": self.REASONING_EFFORT,
             "reasoning_tokens": self._last_reasoning_tokens,
@@ -531,8 +539,8 @@ class GuidedLLM(LLM, Agent):
             },
             "agent_type": "guided_llm",
             "game_rules": "locksmith",
-            "response_preview": self._last_response_content[:200] + "..."
-            if len(self._last_response_content) > 200
+            "response_preview": self._last_response_content[:2000] + "..."
+            if len(self._last_response_content) > 2000
             else self._last_response_content,
         }
 
@@ -563,7 +571,7 @@ class GuidedLLM(LLM, Agent):
                 )
                 self._total_reasoning_tokens += self._last_reasoning_tokens
                 logger.debug(
-                    f"Captured {self._last_reasoning_tokens} reasoning tokens from o3 response"
+                    f"Captured {self._last_reasoning_tokens} reasoning tokens from {self._resolve_model()} response"
                 )
 
     def build_user_prompt(self, latest_frame: FrameData) -> str:
@@ -580,25 +588,28 @@ INT<0,15> values.
 You are playing a game called LockSmith. Rules and strategy:
 * RESET: start over, ACTION1: move up, ACTION2: move down, ACTION3: move left, ACTION4: move right (ACTION5 and ACTION6 do nothing in this game)
 * you may may one action per turn
-* your goal is find and collect a matching key then touch the exit door
+* you goal is to exit door that has key depicted on it
+* you have your own key showed in the left bottom corner
+* to exit the door your personal key picture should match the door key picture
 * 6 levels total, score shows which level, complete all levels to win (grid row 62)
 * start each level with limited energy. you GAME_OVER if you run out (grid row 61)
-* the player is a 4x4 square: [[X,X,X,X],[0,0,0,X],[4,4,4,X],[4,4,4,X]] where X is transparent to the background
+* your player is a 5x5 square: [[12,12,12,12,12], [12,12,12,12,12], [9,9,9,9,9], [9,9,9,9,9], [9,9,9,9,9]]
 * the grid represents a birds-eye view of the level
-* walls are made of INT<10>, you cannot move through a wall
-* walkable floor area is INT<8>
-* you can refill energy by touching energy pills (a 2x2 of INT<6>)
+* walls are made of INT<4>, you cannot move through a wall
+* walkable floor area is INT<3>
 * current key is shown in bottom-left of entire grid
-* the exit door is a 4x4 square with INT<11> border
-* to find a new key shape, touch the key rotator, a 4x4 square denoted by INT<9> and INT<4> in the top-left corner of the square
-* to find a new key color, touch the color rotator, a 4x4 square denoted by INT<9> and INT<2> and in the bottom-left corner of the square
-* to rotate more than once, move 1 space away from the rotator and back on
+* the exit door is a 9x9 square with INT<5> interior
+* to find a new key shape, touch the key rotator, a 4x4 plus sign denoted by INT<0> and INT<1> 
+* if the key shape in the bottom left corner matches the exit door, avoid the key rotator and move towards the exit door
+* if the shape doesn't match, rotate more than once, move 1 space away from the rotator and back on
 * continue rotating the shape and color of the key until the key matches the one inside the exit door (scaled down 2X)
 * if the grid does not change after an action, you probably tried to move into a wall
+* You are ON the rotator only if the player block overlaps the rotator tiles in the current frame.
+* Before making decision, reflect if couple of previous steps are moving your closer to the goal.
 
 An example of a good strategy observation:
-The player 4x4 made of INT<4> and INT<0> is standing below a wall of INT<10>, so I cannot move up anymore and should
-move left towards the rotator with INT<11>.
+The player 5x5 made of INT<12> and INT<9> is standing by a wall of INT<4>, so I cannot move up anymore and should
+move towards the rotator with a good choice of action.
 
 # TURN:
 Call exactly one action.
@@ -606,31 +617,25 @@ Call exactly one action.
         )
 
 
-# Example of a custom LLM agent
-class MyCustomLLM(LLM):
-    """Template for creating your own custom LLM agent."""
+class GuidedLLMls20OpenRouter(GuidedLLMls20, Agent):
+    """Guided Locksmith agent that routes requests through OpenRouter."""
 
-    MAX_ACTIONS = 80
-    MODEL = "gpt-4o-mini"
-    DO_OBSERVATION = True
+    OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-    def build_user_prompt(self, latest_frame: FrameData) -> str:
-        """Customize this method to provide instructions to the LLM."""
-        return textwrap.dedent(
-            """
-# CONTEXT:
-You are an agent playing a dynamic game. Your objective is to
-WIN and avoid GAME_OVER while minimizing actions.
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._openrouter_api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+        self._openrouter_model = os.environ.get("OPENROUTER_MODEL", "").strip()
+        if not self._openrouter_api_key:
+            raise ValueError("OPENROUTER_API_KEY must be set for GuidedLLMls20OpenRouter")
+        if not self._openrouter_model:
+            raise ValueError("OPENROUTER_MODEL must be set for GuidedLLMls20OpenRouter")
+        super().__init__(*args, **kwargs)
 
-One action produces one Frame. One Frame is made of one or more sequential
-Grids. Each Grid is a matrix size INT<0,63> by INT<0,63> filled with
-INT<0,15> values.
-
-# CUSTOM INSTRUCTIONS:
-Add your game instructions and strategy here.
-For example, explain the game rules, objectives, and optimal strategies.
-
-# TURN:
-Call exactly one action.
-        """.format()
+    def _build_client(self) -> OpenAIClient:
+        return OpenAIClient(
+            api_key=self._openrouter_api_key,
+            base_url=self.OPENROUTER_BASE_URL,
         )
+
+    def _resolve_model(self) -> str:
+        return self._openrouter_model

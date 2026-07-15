@@ -39,6 +39,27 @@ HEADERS = {
 }
 
 
+def positive_int(value: str) -> int:
+    steps = int(value)
+    if steps <= 0:
+        raise argparse.ArgumentTypeError("steps must be a positive integer")
+    return steps
+
+
+def apply_steps_override(
+    available_agents: dict[str, type],
+    agent_name: str,
+    steps: Optional[int],
+) -> type:
+    selected_agent_class = available_agents[agent_name]
+    if steps is not None:
+        selected_agent_class.MAX_ACTIONS = steps
+        logger.info(
+            f"Overriding {selected_agent_class.__name__}.MAX_ACTIONS to {steps}"
+        )
+    return selected_agent_class
+
+
 def run_agent(swarm: Swarm) -> None:
     swarm.main()
     os.kill(os.getpid(), signal.SIGINT)
@@ -107,12 +128,21 @@ def main() -> None:
         help="Comma-separated list of tags for the scorecard (e.g., 'experiment,v1.0')",
         default=None,
     )
+    parser.add_argument(
+        "-s",
+        "--steps",
+        type=positive_int,
+        help="Override the selected agent's MAX_ACTIONS for this run.",
+        default=None,
+    )
 
     args = parser.parse_args()
 
     if not args.agent:
         logger.error("An Agent must be specified")
         return
+
+    apply_steps_override(AVAILABLE_AGENTS, args.agent, args.steps)
 
     print(f"{ROOT_URL}/api/games")
 
